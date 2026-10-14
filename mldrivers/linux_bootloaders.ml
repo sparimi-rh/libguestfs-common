@@ -401,6 +401,20 @@ let detect_bootloader (g : G.guestfs) root i_firmware =
     else paths
   in
 
+  (* GRUB2 active on BIOS: either post-MBR signature (MBR disks, RHEL 7-9)
+     or GPT header indicating BIOS+GPT layout (RHEL 10). *)
+  let has_grub2_postmbr_signature g =
+    let devices = g#list_devices () |> Array.to_list in
+    List.exists (fun dev ->
+      let sector_one = g#pread_device dev 512 512L in
+      let grub2_postmbr = PCRE.compile
+        "loading\\x00\\.\\x00\\r\\n\\x00Geom\\x00Read\\x00 Error" in
+      let gpt_header = PCRE.compile "EFI PART" in
+      PCRE.matches grub2_postmbr sector_one ||
+      PCRE.matches gpt_header sector_one
+    ) devices
+  in
+
   (* We can determine if the bootloader config file is grub 1 or
    * grub 2 just by looking at the filename.
    *)
@@ -431,9 +445,34 @@ let detect_bootloader (g : G.guestfs) root i_firmware =
    * https://issues.redhat.com/browse/RHEL-77989
    * https://github.com/libguestfs/libguestfs-common/pull/6
    *)
-  let grub_config =
+  let grub_config, typ =
+    let grub2_efi_rex = PCRE.compile "^/boot/efi/EFI/.*/grub.cfg$" in
+    let grub2_real = "/boot/grub2/grub.cfg" in
+
+    let has_efi_grub =
+      try
+        if g#is_dir "/boot/efi" then
+          let files = g#find "/boot/efi" in
+          Array.exists (
+            fun file ->
+              let full_path = "/boot/efi/" ^ file in
+              PCRE.matches grub2_efi_rex full_path
+          ) files
+        else
+          false
+      with _ -> false in
+
+    let has_grub2 = g#exists grub2_real || has_efi_grub in
+
     match typ with
-    | Grub1 -> grub_config
+    | Grub1 ->
+       if has_grub2 then
+         if has_grub2_postmbr_signature g then
+            (grub2_real, Grub2)
+         else
+            (grub_config, Grub1)
+       else
+         (grub_config, Grub1)
     | Grub2 ->
        let grub2_efi_rex = PCRE.compile "^/boot/efi/EFI/.*/grub.cfg$" in
        let grub2_real = "/boot/grub2/grub.cfg" in
@@ -442,9 +481,9 @@ let detect_bootloader (g : G.guestfs) root i_firmware =
           (* does it look like the "wrapper"? *)
           g#grep "configfile \\$prefix/grub\\.cfg" grub_config <> [||] &&
           g#exists grub2_real then
-         grub2_real
+         (grub2_real, Grub2)
        else
-         grub_config in
+         (grub_config, Grub2) in
 
   let bl =
     match typ with
